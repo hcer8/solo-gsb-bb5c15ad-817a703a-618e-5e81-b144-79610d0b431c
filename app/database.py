@@ -73,6 +73,21 @@ CREATE TABLE IF NOT EXISTS batch_results (
     FOREIGN KEY (batch_id) REFERENCES batches(batch_id)
 );
 
+-- POST /batches 幂等提交：首次请求以 Idempotency-Key + 请求体摘要（SHA-256）
+-- 在同一写事务内原子登记；completed 行的 result_json 即首次 BatchResult 快照，
+-- 同键同体重放时原样返回、不再归档。pending 仅在首次请求处理期间短暂存在
+-- （事务未提交则对其它连接不可见；异常回滚后键可立即重试）。
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+    idempotency_key TEXT PRIMARY KEY,
+    request_digest  TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    batch_id        TEXT,
+    result_json     TEXT,
+    created_at      TEXT NOT NULL,
+    completed_at    TEXT,
+    FOREIGN KEY (batch_id) REFERENCES batches(batch_id)
+);
+
 -- 保留期冻结：每次冻结以某封“有效邮件”为锚点，活跃保护其当前所在的
 -- 整棵会话。不存成员快照——保护集合在清理/查询时按当前父子关系实时
 -- 展开锚点所在会话计算，此后并入该会话的邮件自动受保护；解除冻结

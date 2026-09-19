@@ -5,9 +5,9 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 
-from . import database, service
+from . import database, idempotency, service
 from .config import settings
 from .schemas import (
     BatchIn,
@@ -41,9 +41,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.app_title,
-    version="1.6.0",
+    version="1.7.0",
     description=(
         "批量提交邮件头信息，归并为稳定排序的会话树，诊断重复 ID / 缺失引用 / 引用环；"
+        "POST /batches 支持 Idempotency-Key 幂等提交（同键同体重放首次响应、"
+        "同键不同体 409）；"
         "支持 RFC 5322 原始邮件头导入（POST /imports/rfc5322，解析折行、重复字段与 "
         "RFC 2047 编码词）、邮件保留期（retain_until）、会话活跃冻结/解除冻结与到期批量清理，"
         "人工会话纠偏（POST /thread-corrections），"
@@ -59,15 +61,70 @@ def health() -> dict:
     return {"status": "ok"}
 
 
+async def _raw_request_body(request: Request) -> bytes:
+    # FastAPI 解析 JSON body 时也经由 Request.body()，结果缓存在同一请求上，
+    # 这里再次调用只是取缓存，不会重复读流；在事件循环中 await，避免在同步
+    # 端点里触碰未决协程。
+    return await request.body()
+
+
 @app.post(
     "/batches",
     response_model=BatchResult,
     status_code=201,
     tags=["batches"],
-    summary="提交一批邮件并归并会话",
+    summary="提交一批邮件并归并会话（支持 Idempotency-Key 幂等提交）",
 )
-def submit_batch(payload: BatchIn) -> dict:
-    return service.submit_batch(payload)
+def submit_batch(
+    payload: BatchIn,
+    response: Response,
+    body: bytes = Depends(_raw_request_body),
+    idempotency_key: Optional[str] = Header(
+        None,
+        alias="Idempotency-Key",
+        description=(
+            "可选。携带时以键 + 请求体摘要登记首次结果：同键同体重放首次响应"
+            "（不重复归档），同键不同体返回 409。键为 1～128 个字母数字或 . _ : - 字符。"
+        ),
+    ),
+) -> dict:
+    try:
+        key = idempotency.normalize_idempotency_key(idempotency_key)
+    except idempotency.IdempotencyKeyMalformed as exc:
+        raise HTTPException(status_code=422, detail={"message": str(exc)})
+    if key is None:
+        # 未携带键：保持既有行为
+        return service.submit_batch(payload)
+
+    request_digest = idempotency.digest_request_body(body)
+    try:
+        return service.submit_batch_idempotent(payload, key, request_digest)
+    except idempotency.IdempotencyPayloadMismatch:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "idempotency_payload_mismatch",
+                "message": (
+                    "this Idempotency-Key was already used with a different request "
+                    "body; retry with the same body or a new key"
+                ),
+            },
+        )
+    except idempotency.IdempotencyInProgress:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "idempotency_request_in_progress",
+                "message": (
+                    "a request with this Idempotency-Key is still being processed; "
+                    "retry shortly"
+                ),
+            },
+        )
+    except idempotency.IdempotencyReplay as exc:
+        # 同键同体重放：返回首次 BatchResult 快照，标记幂等重放
+        response.headers["Idempotent-Replay"] = "true"
+        return exc.result
 
 
 @app.post(

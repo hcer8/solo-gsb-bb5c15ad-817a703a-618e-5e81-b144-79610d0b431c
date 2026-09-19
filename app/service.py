@@ -12,7 +12,12 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from . import database, threading
+from . import database, idempotency, threading
+from .idempotency import (
+    IdempotencyInProgress,
+    IdempotencyPayloadMismatch,
+    IdempotencyReplay,
+)
 from .rfc5322 import Rfc5322ParseError, parse_header_blocks
 from .schemas import (
     BatchIn,
@@ -253,147 +258,236 @@ def _build_payload(
     }
 
 
+def _archive_batch(conn: sqlite3.Connection, normalized: list) -> dict:
+    """在给定连接（事务）内完成一次批次归档，返回完整结果快照。
+
+    不自行提交：无幂等键路径在外层提交；幂等路径把 pending 登记、归档与
+    completed 回填放进**同一事务**原子提交，保证“登记首次结果”与归档
+    写入同时生效或同时回滚。
+    """
+
+    existing_ids = {
+        r["message_id"]
+        for r in conn.execute("SELECT message_id FROM messages")
+    }
+
+    # 已归档 ID 整组剔出，作为“重复 ID（历史归档）”诊断
+    archived_duplicates: dict[str, int] = {}
+    fresh: list = []
+    for seq, m in enumerate(normalized, start=1):
+        if m.message_id in existing_ids:
+            archived_duplicates.setdefault(m.message_id, seq)
+        else:
+            fresh.append(m)
+    thread_messages = [
+        ThreadMessage(
+            message_id=m.message_id,
+            in_reply_to=m.in_reply_to,
+            references=tuple(m.references),
+            sent_at=m.sent_at.isoformat(),
+            subject=m.subject,
+        )
+        for m in fresh
+    ]
+    resolution = threading.resolve_batch(
+        thread_messages, existing_ids=existing_ids
+    )
+
+    batch_id = uuid.uuid4().hex
+    submitted_at = _utc_now_iso()
+
+    # 1) 批次元数据（messages/batch_* 均以外键指向它）
+    conn.execute(
+        """
+        INSERT INTO batches
+            (batch_id, submitted_at, total_count, unique_count, invalid_count, tree_count)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            batch_id,
+            submitted_at,
+            len(normalized),
+            len(resolution.first_seen),
+            len(resolution.invalid_ids),
+            0,  # 树数量在构建后回填
+        ),
+    )
+
+    # 2) 写入新邮件（含 invalid；invalid 父指针置 NULL，绝不部分挂接）
+    inserted_ids: set[str] = set()
+    for seq, m in enumerate(normalized, start=1):
+        if m.message_id in inserted_ids or m.message_id in archived_duplicates:
+            continue  # 本批重复的后续出现、历史归档重复，均不重复落库
+        inserted_ids.add(m.message_id)
+        is_invalid = m.message_id in resolution.invalid_ids
+        parent_id = None if is_invalid else resolution.parent_of.get(m.message_id)
+        conn.execute(
+            """
+            INSERT INTO messages
+                (message_id, in_reply_to, "references", sent_at, subject,
+                 parent_id, is_invalid, batch_id, submitted_seq, archived_at,
+                 retain_until)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                m.message_id,
+                m.in_reply_to,
+                json.dumps(m.references, ensure_ascii=False),
+                m.sent_at.isoformat(),
+                m.subject,
+                parent_id,
+                1 if is_invalid else 0,
+                batch_id,
+                seq,
+                submitted_at,
+                m.retain_until.isoformat() if m.retain_until else None,
+            ),
+        )
+
+    # 3) 本批所有有效新邮件向上爬到根，取整棵树（含历史祖先）
+    new_valid_ids = [
+        mid for mid in resolution.first_seen if mid not in resolution.invalid_ids
+    ]
+    root_ids = {_climb_root(conn, mid) for mid in new_valid_ids}
+
+    all_messages: dict[str, ThreadMessage] = {}
+    all_parents: dict[str, Optional[str]] = {}
+    for root_id in root_ids:
+        msgs, parents = _load_subtree(conn, root_id)
+        all_messages.update(msgs)
+        all_parents.update(parents)
+
+    threads = threading.build_forest(all_messages, all_parents)
+
+    result_payload = _build_payload(
+        batch_id,
+        submitted_at,
+        normalized,
+        resolution,
+        archived_duplicates,
+        threads,
+    )
+
+    # 4) 回填树数量 + 诊断明细
+    conn.execute(
+        "UPDATE batches SET tree_count = ? WHERE batch_id = ?",
+        (len(threads), batch_id),
+    )
+    for dup in result_payload["duplicates"]:
+        conn.execute(
+            "INSERT INTO batch_duplicates (batch_id, message_id, archived, first_submitted_seq, occurrences) VALUES (?, ?, ?, ?, ?)",
+            (
+                batch_id,
+                dup["message_id"],
+                1 if dup["archived"] else 0,
+                dup["first_submitted_seq"],
+                json.dumps(dup["occurrences"]),
+            ),
+        )
+    for mr in result_payload["missing_references"]:
+        conn.execute(
+            "INSERT INTO batch_missing_refs (batch_id, message_id, missing) VALUES (?, ?, ?)",
+            (batch_id, mr["message_id"], json.dumps(mr["missing"], ensure_ascii=False)),
+        )
+    for cyc in result_payload["cycles"]:
+        conn.execute(
+            "INSERT INTO batch_cycles (batch_id, idx, members) VALUES (?, ?, ?)",
+            (batch_id, cyc["index"], json.dumps(cyc["members"], ensure_ascii=False)),
+        )
+
+    # 5) 结果快照
+    conn.execute(
+        "INSERT INTO batch_results (batch_id, result_json) VALUES (?, ?)",
+        (batch_id, json.dumps(result_payload, ensure_ascii=False)),
+    )
+
+    return result_payload
+
+
 def submit_batch(payload: BatchIn) -> dict:
-    """归并、落库、返回完整结果。同库写操作串行化。"""
+    """归并、落库、返回完整结果。同库写操作串行化（无幂等键路径）。"""
 
     normalized = [m.normalized() for m in payload.messages]
 
     with database.write_lock():
         conn = database.connect()
         try:
-            existing_ids = {
-                r["message_id"]
-                for r in conn.execute("SELECT message_id FROM messages")
-            }
+            result_payload = _archive_batch(conn, normalized)
+            conn.commit()
+            return result_payload
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
-            # 已归档 ID 整组剔出，作为“重复 ID（历史归档）”诊断
-            archived_duplicates: dict[str, int] = {}
-            fresh: list = []
-            for seq, m in enumerate(normalized, start=1):
-                if m.message_id in existing_ids:
-                    archived_duplicates.setdefault(m.message_id, seq)
-                else:
-                    fresh.append(m)
-            thread_messages = [
-                ThreadMessage(
-                    message_id=m.message_id,
-                    in_reply_to=m.in_reply_to,
-                    references=tuple(m.references),
-                    sent_at=m.sent_at.isoformat(),
-                    subject=m.subject,
+
+def submit_batch_idempotent(
+    payload: BatchIn, idempotency_key: str, request_digest: str
+) -> dict:
+    """携带 Idempotency-Key 的批次提交：原子登记首次结果，重放不重复归档。
+
+    进程内写锁串行化同库写操作；在 ``BEGIN IMMEDIATE`` 单事务内：
+
+    - 键不存在：插入 pending 登记行，执行归档，再把键行回填为 completed
+      （含 batch_id 与首次 BatchResult JSON 快照），随后与归档**同一事务
+      提交**。并发同键请求中只有一个能插入成功，其余在锁后看到登记；
+    - 键已 completed：请求体摘要相同 -> 抛 :class:`IdempotencyReplay`
+      携带首次快照（接口层原样返回，不写库、不重复归档）；摘要不同 ->
+      :class:`IdempotencyPayloadMismatch`（-> 409）；
+    - 键仍 pending（仅多进程部署、进程锁无法串行化时可见；本服务事务
+      只在 completed 时提交，pending 不会跨崩溃残留）->
+      :class:`IdempotencyInProgress`（-> 409，稍后重试）。
+    """
+
+    normalized = [m.normalized() for m in payload.messages]
+
+    with database.write_lock():
+        conn = database.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT status, request_digest, result_json FROM idempotency_keys WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if row is not None:
+                if row["status"] == "completed":
+                    if row["request_digest"] != request_digest:
+                        raise IdempotencyPayloadMismatch(
+                            "Idempotency-Key was already used with a different request body"
+                        )
+                    raise IdempotencyReplay(json.loads(row["result_json"]))
+                raise IdempotencyInProgress(
+                    "a request with this Idempotency-Key is still being processed"
                 )
-                for m in fresh
-            ]
-            resolution = threading.resolve_batch(
-                thread_messages, existing_ids=existing_ids
-            )
 
-            batch_id = uuid.uuid4().hex
-            submitted_at = _utc_now_iso()
-
-            # 1) 批次元数据（messages/batch_* 均以外键指向它）
+            now = _utc_now_iso()
             conn.execute(
                 """
-                INSERT INTO batches
-                    (batch_id, submitted_at, total_count, unique_count, invalid_count, tree_count)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO idempotency_keys
+                    (idempotency_key, request_digest, status, created_at)
+                VALUES (?, ?, 'pending', ?)
+                """,
+                (idempotency_key, request_digest, now),
+            )
+
+            result_payload = _archive_batch(conn, normalized)
+
+            conn.execute(
+                """
+                UPDATE idempotency_keys
+                SET status = 'completed',
+                    batch_id = ?,
+                    result_json = ?,
+                    completed_at = ?
+                WHERE idempotency_key = ?
                 """,
                 (
-                    batch_id,
-                    submitted_at,
-                    len(normalized),
-                    len(resolution.first_seen),
-                    len(resolution.invalid_ids),
-                    0,  # 树数量在构建后回填
+                    result_payload["batch_id"],
+                    json.dumps(result_payload, ensure_ascii=False),
+                    now,
+                    idempotency_key,
                 ),
-            )
-
-            # 2) 写入新邮件（含 invalid；invalid 父指针置 NULL，绝不部分挂接）
-            inserted_ids: set[str] = set()
-            for seq, m in enumerate(normalized, start=1):
-                if m.message_id in inserted_ids or m.message_id in archived_duplicates:
-                    continue  # 本批重复的后续出现、历史归档重复，均不重复落库
-                inserted_ids.add(m.message_id)
-                is_invalid = m.message_id in resolution.invalid_ids
-                parent_id = None if is_invalid else resolution.parent_of.get(m.message_id)
-                conn.execute(
-                    """
-                    INSERT INTO messages
-                        (message_id, in_reply_to, "references", sent_at, subject,
-                         parent_id, is_invalid, batch_id, submitted_seq, archived_at,
-                         retain_until)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        m.message_id,
-                        m.in_reply_to,
-                        json.dumps(m.references, ensure_ascii=False),
-                        m.sent_at.isoformat(),
-                        m.subject,
-                        parent_id,
-                        1 if is_invalid else 0,
-                        batch_id,
-                        seq,
-                        submitted_at,
-                        m.retain_until.isoformat() if m.retain_until else None,
-                    ),
-                )
-
-            # 3) 本批所有有效新邮件向上爬到根，取整棵树（含历史祖先）
-            new_valid_ids = [
-                mid for mid in resolution.first_seen if mid not in resolution.invalid_ids
-            ]
-            root_ids = {_climb_root(conn, mid) for mid in new_valid_ids}
-
-            all_messages: dict[str, ThreadMessage] = {}
-            all_parents: dict[str, Optional[str]] = {}
-            for root_id in root_ids:
-                msgs, parents = _load_subtree(conn, root_id)
-                all_messages.update(msgs)
-                all_parents.update(parents)
-
-            threads = threading.build_forest(all_messages, all_parents)
-
-            result_payload = _build_payload(
-                batch_id,
-                submitted_at,
-                normalized,
-                resolution,
-                archived_duplicates,
-                threads,
-            )
-
-            # 4) 回填树数量 + 诊断明细
-            conn.execute(
-                "UPDATE batches SET tree_count = ? WHERE batch_id = ?",
-                (len(threads), batch_id),
-            )
-            for dup in result_payload["duplicates"]:
-                conn.execute(
-                    "INSERT INTO batch_duplicates (batch_id, message_id, archived, first_submitted_seq, occurrences) VALUES (?, ?, ?, ?, ?)",
-                    (
-                        batch_id,
-                        dup["message_id"],
-                        1 if dup["archived"] else 0,
-                        dup["first_submitted_seq"],
-                        json.dumps(dup["occurrences"]),
-                    ),
-                )
-            for mr in result_payload["missing_references"]:
-                conn.execute(
-                    "INSERT INTO batch_missing_refs (batch_id, message_id, missing) VALUES (?, ?, ?)",
-                    (batch_id, mr["message_id"], json.dumps(mr["missing"], ensure_ascii=False)),
-                )
-            for cyc in result_payload["cycles"]:
-                conn.execute(
-                    "INSERT INTO batch_cycles (batch_id, idx, members) VALUES (?, ?, ?)",
-                    (batch_id, cyc["index"], json.dumps(cyc["members"], ensure_ascii=False)),
-                )
-
-            # 5) 结果快照
-            conn.execute(
-                "INSERT INTO batch_results (batch_id, result_json) VALUES (?, ?)",
-                (batch_id, json.dumps(result_payload, ensure_ascii=False)),
             )
 
             conn.commit()

@@ -52,7 +52,7 @@ ports:
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `POST` | `/batches` | 提交一批邮件，返回会话树与全部诊断（HTTP 201） |
+| `POST` | `/batches` | 提交一批邮件，返回会话树与全部诊断（HTTP 201）；支持 `Idempotency-Key` 幂等提交（同键同体重放首次响应，同键不同体 409） |
 | `POST` | `/imports/rfc5322` | **导入一组 RFC 5322 原始邮件头**：解析折行、重复字段与 RFC 2047 编码词，归一为批次模型后一次性归档（HTTP 201） |
 | `GET` | `/batches?limit=50&offset=0` | 批次列表，按提交时间倒序 |
 | `GET` | `/batches/{batch_id}` | 取该批次的归档结果快照（与提交响应完全一致） |
@@ -73,6 +73,10 @@ ports:
 不参与冻结与清理。
 
 未知 ID：批次 / 邮件查询、`/relinks` 返回 **404**；请求体不合法返回 **422**；
+`Idempotency-Key` 头格式不合法（空值、超长、含空白或非法字符）同样返回
+**422** 且不占键；同键不同请求体、或同键首个请求仍在处理（仅多进程并发可能
+出现）返回 **409**（`idempotency_payload_mismatch` /
+`idempotency_request_in_progress`）。
 `/relinks` 若合并候选关系后形成环，整次返回 **409** 且不写库。冻结锚点未知
 返回 **404**，锚点为环内邮件返回 **409**；解除一个不存在的冻结返回 **404**。
 `POST /thread-sla/evaluate` 锚点邮件未知返回 **404**，锚点为环内邮件返回 **409**。
@@ -136,6 +140,51 @@ curl 'http://localhost:8000/threads/A/page?limit=2&cursor=djEcxY%E2%80%A6'
   }
 }
 ```
+
+### 幂等提交：`Idempotency-Key` 请求头
+
+`POST /batches` 支持可选的 `Idempotency-Key` 请求头，用于网络重试等场景下
+保证“同一请求只归档一次”：
+
+- **首次请求**：服务以「键 + 请求体摘要（原始 body 字节的 SHA-256）」在归档
+  事务内**原子登记**首次结果；响应即正常 `BatchResult`（HTTP 201）；
+- **相同键 + 相同请求体**：原样重放首次 `BatchResult`（含首次 `batch_id` /
+  `submitted_at` 快照），**不重复归档、不产生重复诊断**，响应带
+  `Idempotent-Replay: true` 响应头；
+- **相同键 + 不同请求体**：返回 **409**
+  `{"detail": {"error": "idempotency_payload_mismatch", …}}`，不写库；
+  请求体按**字节**比较——JSON 字段顺序或空白不同也算不同内容，请逐字节重放；
+- **并发**：同键并发请求只有一个真正归档，其余在首个事务提交后读到登记行，
+  得到相同的重放响应（进程内写锁 + `BEGIN IMMEDIATE` 单事务登记）。多进程
+  部署若恰好在首个请求处理期间到达，会收到 **409**
+  `idempotency_request_in_progress`，稍后重试即可得到重放结果；
+- **未携带键（或不带该头）**：完全保持既有行为，每次提交独立归档；
+- **键格式**：去除首尾空白后长度 1～128，仅允许字母、数字与 `.` `_` `:` `-`；
+  不合法（含空值、空白、空格、`/`、`@`、非 ASCII 等）返回 **422**，不写库、
+  不占用该键。请求体本身不合法（如空批次）仍返回 **422**，且不登记键，
+  客户端修正后可用同一键重试。
+
+幂等仅作用于 `POST /batches`；`POST /imports/rfc5322` 不参与（不带键即每次
+独立归档）。登记随首次归档在同一 SQLite 事务提交，归档失败则一并回滚，
+不会残留“占键”记录。
+
+```bash
+# 首次提交（键建议使用 UUID/ULID，由客户端生成并在重试间保持不变）
+curl -X POST http://localhost:8000/batches \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: 7f35d0e2-9a2c-4e6a-8b1f-2d6c9e0a4f71' \
+  -d @batch.json
+
+# 网络超时后用同一个键、同一份 body 原样重试：
+# 返回首次 BatchResult（响应头 Idempotent-Replay: true），不会重复归档
+curl -X POST http://localhost:8000/batches \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: 7f35d0e2-9a2c-4e6a-8b1f-2d6c9e0a4f71' \
+  -d @batch.json
+```
+
+> 同键换了不同内容时返回 409，是为了防止重试链路中误用旧键掩盖真实的新
+> 提交；此时应使用新键提交新内容，或用原始 body 完成重放。
 
 ### 提交示例
 
@@ -679,6 +728,9 @@ SQLite（WAL 模式），表在服务启动时自动创建：
 - `batch_duplicates` / `batch_missing_refs` / `batch_cycles`：诊断明细；
 - `batch_results`：完整结果 JSON 快照，`GET /batches/{id}` 原样返回（补链、人工
   纠偏、保留期清理只更新/删除 `messages`，快照与诊断表永不改写）；
+- `idempotency_keys`：`POST /batches` 的 `Idempotency-Key` 登记（键、请求体
+  SHA-256 摘要、pending/completed 状态与首次 BatchResult 快照）；登记与首次
+  归档在同一事务提交，同键同体重放时直接返回快照、不再归档；
 - `retention_freezes`：冻结锚点（活跃冻结不存成员快照；保护集合在使用时按当前
   父子关系实时展开锚点所在会话计算）。
 

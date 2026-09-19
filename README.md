@@ -5,7 +5,10 @@
 并给出**重复 ID、缺失引用、引用环**三类诊断。批次请求与归并结果均持久化到 SQLite，
 可随时查询。除直接提交结构化字段（`POST /batches`）外，还支持
 **RFC 5322 原始邮件头导入**（`POST /imports/rfc5322`，用 Python 标准库解析折行、
-重复字段与 RFC 2047 编码词，解析通过后复用同一套归档逻辑一次性写入）。此外支持
+重复字段与 RFC 2047 编码词，解析通过后复用同一套归档逻辑一次性写入）。
+`POST /batches` 支持携带 `Idempotency-Key` **幂等提交**：相同键与相同请求体重放
+首次批次响应且不重复归档，相同键不同请求体返回 409，不携带键则保持原有行为。
+此外支持
 **会话活跃冻结 / 解除冻结**、按保留期的**到期批量清理**
 （删除中间节点时自动压缩会话树，支持 `dry_run` 预览）、**人工会话纠偏**
 （`POST /thread-corrections`，带 revision 乐观校验地调整任一有效邮件的父节点）、
@@ -52,7 +55,7 @@ ports:
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `POST` | `/batches` | 提交一批邮件，返回会话树与全部诊断（HTTP 201） |
+| `POST` | `/batches` | 提交一批邮件，返回会话树与全部诊断（HTTP 201）；可携带 `Idempotency-Key` 幂等提交（同键同内容重放、同键不同内容 **409**） |
 | `POST` | `/imports/rfc5322` | **导入一组 RFC 5322 原始邮件头**：解析折行、重复字段与 RFC 2047 编码词，归一为批次模型后一次性归档（HTTP 201） |
 | `GET` | `/batches?limit=50&offset=0` | 批次列表，按提交时间倒序 |
 | `GET` | `/batches/{batch_id}` | 取该批次的归档结果快照（与提交响应完全一致） |
@@ -75,6 +78,9 @@ ports:
 未知 ID：批次 / 邮件查询、`/relinks` 返回 **404**；请求体不合法返回 **422**；
 `/relinks` 若合并候选关系后形成环，整次返回 **409** 且不写库。冻结锚点未知
 返回 **404**，锚点为环内邮件返回 **409**；解除一个不存在的冻结返回 **404**。
+`POST /batches` 的 `Idempotency-Key` 格式非法（空值 / 含空白 / 非可见 ASCII /
+超过 255 字符）返回 **422**；键已被不同请求体使用返回 **409**
+`idempotency_conflict` 且不写库。
 `POST /thread-sla/evaluate` 锚点邮件未知返回 **404**，锚点为环内邮件返回 **409**。
 `POST /thread-subject-audit` 锚点邮件未知返回 **404**，锚点为环内邮件返回 **409**。
 `POST /thread-corrections` 的错误码见下节（待调整邮件 / 目标父未知 **404**；
@@ -199,6 +205,68 @@ curl -X POST http://localhost:8000/batches \
 > 会话树节点（`threads` 与分页 `items`）沿用固定字段集，不内嵌
 > `retain_until` / 冻结状态——这两项通过 `GET /messages/{id}` 查询；批次快照
 > 的结构因此保持稳定，归档后永不改写。
+
+### 幂等提交：`Idempotency-Key` 请求头
+
+网络重试或客户端超时重发时，可在 `POST /batches` 请求头携带
+`Idempotency-Key`，服务以**请求体摘要 + 键**在单个写事务内原子登记首次结果，
+保证同一逻辑提交只归档一次：
+
+- **首次提交**（键第一次出现）：正常归并归档、返回 **201**，响应头
+  `Idempotency-Replayed: false`，并在同一事务内登记「键 → 请求体摘要 → 批次」；
+- **同键 + 同内容重放**：原样返回**首次批次响应**（同一个 `batch_id` /
+  `submitted_at` / 诊断，HTTP 仍为 **201**），响应头
+  `Idempotency-Replayed: true`；**不会再次归档**——即使首封邮件此时已在库中，
+  重放结果也不会把它们记成“历史归档重复”，而是逐字节复现首次快照（与
+  `GET /batches/{batch_id}` 一致）；
+- **同键 + 不同内容**：返回 **409**
+  `{"detail": {"error": "idempotency_conflict", …}}`，**不写库**；冲突不占用
+  键，随后以原内容重放仍成功；
+- **不携带键**：保持原有行为，每次提交都正常归档一批。
+
+“相同内容”按**归一化后的请求体**比较（对摘要做 sha256）：与请求 JSON 的
+排版空白、字段书写顺序无关；时间先统一换算到 UTC（naive 视为 UTC），因此
+`2026-09-18T09:00:00Z` 与 `2026-09-18T09:00:00+00:00` 视为相同内容，而
+`2026-09-18T09:00:00+01:00`（晚一小时）是不同内容；邮件数组的**顺序参与
+比较**（顺序不同即 409）。
+
+**键格式**：1～255 个可见 ASCII 字符（`!`～`~`，不含空格 / 制表符等空白与
+控制字符）；空值、含空白、含非 ASCII 或超长的键返回 **422**，此时不归档、
+也不登记键。建议使用 UUID 等客户端生成的不透明随机串。
+
+并发语义安全：同键请求并发到达时，登记与归档在**同一写事务**
+（`BEGIN IMMEDIATE`）内完成——仅一个请求完成首次归档，其余并发请求要么重放
+首次结果（内容一致），要么收到 409（内容不同），不会出现重复批次。
+幂等仅作用于 `POST /batches`；`POST /imports/rfc5322` 不读取该头。
+
+```bash
+# 首次提交
+curl -i -X POST http://localhost:8000/batches \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: 7f3c9b1e-9a2d-4e6f-8b0a-1c2d3e4f5a6b' \
+  -d '{"messages":[{"message_id":"A","in_reply_to":null,"references":[],
+       "sent_at":"2026-09-18T08:00:00Z","subject":"例会通知"}]}'
+# -> HTTP 201，响应头 Idempotency-Replayed: false
+
+# 同键同内容重试：重放首次响应，不重复归档
+curl -i -X POST http://localhost:8000/batches \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: 7f3c9b1e-9a2d-4e6f-8b0a-1c2d3e4f5a6b' \
+  -d '{"messages":[{"message_id":"A","in_reply_to":null,"references":[],
+       "sent_at":"2026-09-18T08:00:00Z","subject":"例会通知"}]}'
+# -> HTTP 201，响应头 Idempotency-Replayed: true，响应体与首次完全一致
+```
+
+同键不同内容时（HTTP **409**，不写库）：
+
+```json
+{
+  "detail": {
+    "error": "idempotency_conflict",
+    "message": "Idempotency-Key has already been used with a different request payload"
+  }
+}
+```
 
 ### RFC 5322 原始邮件头导入：`POST /imports/rfc5322`
 
@@ -679,12 +747,14 @@ SQLite（WAL 模式），表在服务启动时自动创建：
 - `batch_duplicates` / `batch_missing_refs` / `batch_cycles`：诊断明细；
 - `batch_results`：完整结果 JSON 快照，`GET /batches/{id}` 原样返回（补链、人工
   纠偏、保留期清理只更新/删除 `messages`，快照与诊断表永不改写）；
+- `idempotency_keys`：`POST /batches` 幂等登记（键为主键，存请求体摘要与对应
+  `batch_id`）；与批次结果在同一写事务内登记，保证并发下只归档一次；
 - `retention_freezes`：冻结锚点（活跃冻结不存成员快照；保护集合在使用时按当前
   父子关系实时展开锚点所在会话计算）。
 
 写操作在进程内串行化（线程锁 + 单连接写事务），保证并发提交 / 补链 / 纠偏 /
-冻结 / 清理下的归并一致性；补链、人工纠偏、保留期实际清理的全部父指针变更与
-删除均在**单个事务**内提交。
+冻结 / 清理下的归并一致性；幂等登记与批次归档、补链、人工纠偏、保留期实际
+清理的全部父指针变更与删除均在**单个事务**内提交。
 
 服务启动的建表 DDL 幂等；早期数据库（`messages` 无 `retain_until` 列、含旧版
 冻结成员快照表 `retention_freeze_members`）会在启动时自动补列、并删除已废弃的

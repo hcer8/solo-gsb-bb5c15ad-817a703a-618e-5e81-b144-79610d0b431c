@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Annotated, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
 
 from . import database, service
 from .config import settings
@@ -41,9 +41,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.app_title,
-    version="1.6.0",
+    version="1.7.0",
     description=(
         "批量提交邮件头信息，归并为稳定排序的会话树，诊断重复 ID / 缺失引用 / 引用环；"
+        "POST /batches 支持 Idempotency-Key 幂等提交（同键同内容重放首次批次响应，"
+        "同键不同内容 409，未携带键保持原有行为）；"
         "支持 RFC 5322 原始邮件头导入（POST /imports/rfc5322，解析折行、重复字段与 "
         "RFC 2047 编码词）、邮件保留期（retain_until）、会话活跃冻结/解除冻结与到期批量清理，"
         "人工会话纠偏（POST /thread-corrections），"
@@ -64,10 +66,41 @@ def health() -> dict:
     response_model=BatchResult,
     status_code=201,
     tags=["batches"],
-    summary="提交一批邮件并归并会话",
+    summary="提交一批邮件并归并会话（支持 Idempotency-Key 幂等提交）",
 )
-def submit_batch(payload: BatchIn) -> dict:
-    return service.submit_batch(payload)
+def submit_batch(
+    payload: BatchIn,
+    response: Response,
+    idempotency_key: Annotated[
+        Optional[str],
+        Header(
+            alias="Idempotency-Key",
+            min_length=1,
+            max_length=255,
+            pattern=r"^[\x21-\x7e]+$",
+            description=(
+                "幂等键：1～255 个可见 ASCII 字符（不含空白）。携带时同键同内容重放"
+                "首次批次响应（201，响应头 Idempotency-Replayed: true），同键不同内容"
+                "返回 409；不携带则保持每次提交都归档的原有行为。"
+            ),
+        ),
+    ] = None,
+) -> dict:
+    try:
+        result, replayed = service.submit_batch(payload, idempotency_key)
+    except service.IdempotencyConflict:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "idempotency_conflict",
+                "message": (
+                    "Idempotency-Key has already been used with a different request payload"
+                ),
+            },
+        )
+    # 首次提交与重放统一返回 201；重放额外给出提示响应头
+    response.headers["Idempotency-Replayed"] = "true" if replayed else "false"
+    return result
 
 
 @app.post(

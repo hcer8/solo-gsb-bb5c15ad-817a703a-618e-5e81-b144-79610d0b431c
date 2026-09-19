@@ -67,6 +67,17 @@ CREATE TABLE IF NOT EXISTS batch_cycles (
     FOREIGN KEY (batch_id) REFERENCES batches(batch_id)
 );
 
+-- POST /batches 幂等登记表：以 Idempotency-Key 为主键，原子登记首次提交的
+-- 请求体摘要（request_digest）与归档批次。相同键重放时按摘要区分：摘要
+-- 一致则原样重放首次响应（不再归档），不一致则由服务层拒绝（409）。
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+    key            TEXT PRIMARY KEY,
+    request_digest TEXT NOT NULL,
+    batch_id       TEXT NOT NULL,
+    created_at     TEXT NOT NULL,
+    FOREIGN KEY (batch_id) REFERENCES batches(batch_id)
+);
+
 CREATE TABLE IF NOT EXISTS batch_results (
     batch_id TEXT PRIMARY KEY,
     result_json TEXT NOT NULL,
